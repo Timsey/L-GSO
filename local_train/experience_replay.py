@@ -11,6 +11,10 @@ class ExperienceReplay:
         self._sphere_cut = sphere_cut
         self._y = torch.zeros(0, self._y_dim).float().to('cpu')
         self._condition = torch.zeros(0, self._x_dim + self._psi_dim).float().to('cpu')
+        self.logs = {
+            "stored": [],
+            "retrieved": [],
+        }
 
     def add(self, y, condition):
         if y is None and condition is None:
@@ -21,6 +25,9 @@ class ExperienceReplay:
         return self
 
     def extract(self, psi, step):
+        print(" All data stored: [psi, x].shape = {}, y.shape = {}".format(self._condition.shape, self._y.shape))
+        self.logs["stored"].append(len(self._y))
+
         psi = psi.float().to('cpu').detach().clone()
 
         if self._sphere_cut:
@@ -35,6 +42,10 @@ class ExperienceReplay:
             mask = torch.tensor(new_mask).bool()
         y = (self._y[mask]).to(self._device)
         condition = (self._condition[mask]).to(self._device)
+
+        print(" Retrieving from buffer: [psi, x].shape = {}, y.shape = {}".format(condition.shape, y.shape))
+        self.logs["retrieved"].append(len(y))
+
         return y, condition
 
 

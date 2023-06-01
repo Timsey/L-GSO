@@ -73,6 +73,8 @@ def average_block_wise(x, num_repetitions):
 class BaseConditionalGenerationOracle(BaseConditionalGeneratorModel, ABC):
     """
     Base class for implementation of loss oracle.
+
+    This is both the base class for YModel (target functions), and the baseclass for GANModel (surrogates)!
     """
     def __init__(self, y_model, psi_dim, x_dim, y_dim):
         super(BaseConditionalGenerationOracle, self).__init__()
@@ -102,12 +104,17 @@ class BaseConditionalGenerationOracle(BaseConditionalGeneratorModel, ABC):
             else:
                 n = len(condition)
                 conditions = condition.repeat(1, num_repetitions).view(num_repetitions * n, -1)
+            # Sample x (`condition` only contains psi until now)
             conditions = torch.cat([
                 conditions,
                 self._y_model.sample_x(len(conditions)).to(self.device)
             ], dim=1)
+            # Generate using these psi and x points. This is either the target function, or the surrogate, depending
+            #  on from what superclass this function `func` is called.
             y = self.generate(conditions)
             # loss = self._y_model.loss(y=y)
+            # conditions not necessary for surrogate: e.g., target function is not evaluated here, only surrogate
+            #  output is used.
             loss = self._y_model.loss(y=y, conditions=conditions)
             if len(condition.size()) == 1:
                 return loss.mean()
@@ -137,7 +144,10 @@ class BaseConditionalGenerationOracle(BaseConditionalGeneratorModel, ABC):
         condition = condition.detach().clone().to(self.device)
         condition.requires_grad_(True)
         if isinstance(num_repetitions, int):
-            return grad([self.func(condition, num_repetitions=num_repetitions).sum()], [condition])[0]
+            func_vals = self.func(condition, num_repetitions=num_repetitions)
+            if torch.isnan(func_vals).any():
+                print(func_vals)
+            return grad([func_vals.sum()], [condition])[0]
         else:
             return grad([self.func(condition).sum()], [condition])[0]
 

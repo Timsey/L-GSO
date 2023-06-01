@@ -3,7 +3,7 @@ import pyro
 import numpy as np
 from pyro import distributions as dist
 from local_train.base_model import BaseConditionalGenerationOracle
-from sklearn.datasets import load_boston
+# from sklearn.datasets import load_boston
 import torch.nn.functional as F
 import torch.nn as nn
 from scipy.stats import norm
@@ -41,11 +41,14 @@ def average_block_wise(x, num_repetitions):
 
 
 class YModel(BaseConditionalGenerationOracle):
-    def __init__(self,
-                 device,
-                 psi_init: torch.Tensor,
-                 x_range: tuple = (-10, 10), y_dim=1,
-                 loss=lambda y, **kwargs: OptLoss.SigmoidLoss(y, 5, 10)):
+    def __init__(
+            self,
+            device,
+            psi_init: torch.Tensor,
+            x_range: tuple = (-10, 10),
+            y_dim=1,
+            loss=lambda y, **kwargs: OptLoss.SigmoidLoss(y, 5, 10)
+        ):
         super(YModel, self).__init__(y_model=None,
                                      psi_dim=len(psi_init),
                                      x_dim=1, y_dim=y_dim)  # hardcoded values
@@ -113,6 +116,7 @@ class YModel(BaseConditionalGenerationOracle):
         raise NotImplementedError("First call self.make_condition_sample")
 
     def make_condition_sample(self, data):
+        # This changes self.sample (of the target dist!)
         self.condition_sample = poutine.condition(self.sample, data=data)
 
     def generate_data_at_point(self, n_samples_per_dim, current_psi):
@@ -122,56 +126,108 @@ class YModel(BaseConditionalGenerationOracle):
         data = self.condition_sample(1).detach().to(self.device)
         return data.reshape(-1, self._y_dim), torch.cat([mus, xs], dim=1)
 
-    def generate_local_data(self, n_samples_per_dim, step, current_psi, std=0.1):
-        xs = self.sample_x(n_samples_per_dim * (n_samples + 1))
-        mus = torch.empty((xs.shape[0], current_psi.shape[1])).to(self.device)
-
-        iterator = 0
-        for dim in range(current_psi.shape[1]):
-            for dir_step in [-step, step]:
-                random_mask = torch.torch.randn_like(current_psi)
-                random_mask[0, dim] = 0
-                new_psi = current_psi + random_mask * std
-                new_psi[0, dim] += dir_step
-
-                mus[iterator:
-                    iterator + n_samples_per_dim, :] = new_psi.repeat(n_samples_per_dim, 1)
-                iterator += n_samples_per_dim
-
-        mus[iterator: iterator + n_samples_per_dim, :] = current_psi.repeat(n_samples_per_dim, 1).clone().detach()
-
-        self.make_condition_sample({'mu': mus, 'x': xs})
-        data = self.condition_sample().detach().to(self.device)
-        return data.reshape(-1, self._y_dim), torch.cat([mus, xs], dim=1)
+    # def generate_local_data(self, n_samples_per_dim, step, current_psi, std=0.1):
+    #     xs = self.sample_x(n_samples_per_dim * (n_samples + 1))
+    #     mus = torch.empty((xs.shape[0], current_psi.shape[1])).to(self.device)
+    #
+    #     iterator = 0
+    #     for dim in range(current_psi.shape[1]):
+    #         for dir_step in [-step, step]:
+    #             random_mask = torch.torch.randn_like(current_psi)
+    #             random_mask[0, dim] = 0
+    #             new_psi = current_psi + random_mask * std
+    #             new_psi[0, dim] += dir_step
+    #
+    #             mus[iterator:
+    #                 iterator + n_samples_per_dim, :] = new_psi.repeat(n_samples_per_dim, 1)
+    #             iterator += n_samples_per_dim
+    #
+    #     mus[iterator: iterator + n_samples_per_dim, :] = current_psi.repeat(n_samples_per_dim, 1).clone().detach()
+    #
+    #     self.make_condition_sample({'mu': mus, 'x': xs})
+    #     data = self.condition_sample().detach().to(self.device)
+    #     return data.reshape(-1, self._y_dim), torch.cat([mus, xs], dim=1)
 
     def generate_local_data_lhs(self, n_samples_per_dim, step, current_psi, n_samples=2):
+        # n_samples_per_dim=3000, n_samples=2 --> xs.shape = [15000, 2]
+        # x is sampled uniformly in ((-2, 0), (2, 5)) using pyro (for Three Hump)
         xs = self.sample_x(n_samples_per_dim * (n_samples + 1))
 
         if n_samples == 0:
             mus = torch.zeros(0, len(current_psi)).float().to(self.device)
         else:
+            # len(current_psi) = 2, n_samples = 4 --> mus.shape = [4, 2]
+            # First arg = lhs factors, second arg = num of lhs samples per factor.
             mus = torch.tensor(lhs(len(current_psi), n_samples)).float().to(self.device)
-        mus = step * (mus * 2 - 1) + current_psi
-        mus = torch.cat([mus, current_psi.view(1, -1)])
-        mus = mus.repeat(1, n_samples_per_dim).reshape(-1, len(current_psi))
-        self.make_condition_sample({'mu': mus, 'x': xs})
-        data = self.condition_sample(1).detach().to(self.device)
-        return data.reshape(-1, self._y_dim), torch.cat([mus, xs], dim=1)
 
-    def generate_local_data_lhs_normal(self, n_samples_per_dim, sigma, current_psi, n_samples=2):
-        xs = self.sample_x(n_samples_per_dim * (n_samples + 1))
-        mus = np.append(lhs(len(current_psi), n_samples), np.ones((1, len(current_psi))) / 2., axis=0)
-        for i in range(len(current_psi)):
-            mus[:, i] = norm(loc=current_psi[i].item(), scale=sigma[i].item()).ppf(
-                mus[:, i]
-            )
-        mus = torch.tensor(mus).float().to(self.device)
-        conditions_grid = mus.clone().detach()
+        # Looks like mu is transformed from [0, 1] --> [-1, 1], scaled by step (epsilon), and then centered around psi
+        mus = step * (mus * 2 - 1) + current_psi
+        # Now psi is added to mu (the center?). So I guess the idea is to have n_samples / 2 samples on each 'side' of
+        #  psi, as well as psi. Adding psi here is presumably the reason we do n_samples + 1 in the `xs` line above.
+        mus = torch.cat([mus, current_psi.view(1, -1)])
+        # Now we copy mu n_samples_per_dim times (repeat does this), so mu goes from [5, 2] --> [15000, 2].
         mus = mus.repeat(1, n_samples_per_dim).reshape(-1, len(current_psi))
-        self.make_condition_sample({'mu': mus, 'x': xs})
+        self.make_condition_sample({'mu': mus, 'x': xs})  # This uses `poutine` to create self.condition_sample().
+        # This ends up sampling a shape [15000, 1] tensor.: this is y, sampled at the [psi, x] values in `condition`.
         data = self.condition_sample(1).detach().to(self.device)
-        r_grid = average_block_wise(self.loss(data), n_samples_per_dim)
-        return data.reshape(-1, self._y_dim), torch.cat([mus, xs], dim=1), conditions_grid, r_grid
+        # In the end, we sample n_samples + 1 psis, and sample n_samples_per_dim x for each psi.
+        # The conditioning with poutine makes this hard to read, but essentially we are giving the sampling
+        #  operations 15000 points to sample around, each given by a 2-dim psi value and a 2-dim x value.
+        #  The psi values are sample with a delta, meaning that we only sample n_samples+1 different psi values, as
+        #  there are only n_samples+1 unique psi values in the {mus, xs} condition. The xs are sampled uniformly, see
+        #  e.g. the x_dist in the Hump problem, corresponding to the [-2, 0] and [2, 5] intervals given for the problem
+        #  in the paper. Essentially most of that already happens
+        y = data.reshape(-1, self._y_dim)
+        cond = torch.cat([mus, xs], dim=1)
+        print(" New samples: [psi, x].shape = {}, y.shape = {}".format(cond.shape, y.shape))
+        return y, cond
+
+    # def generate_local_data_lhs_normal(self, n_samples_per_dim, sigma, current_psi, n_samples=2):
+    #     xs = self.sample_x(n_samples_per_dim * (n_samples + 1))
+    #     mus = np.append(lhs(len(current_psi), n_samples), np.ones((1, len(current_psi))) / 2., axis=0)
+    #     for i in range(len(current_psi)):
+    #         mus[:, i] = norm(loc=current_psi[i].item(), scale=sigma[i].item()).ppf(
+    #             mus[:, i]
+    #         )
+    #     mus = torch.tensor(mus).float().to(self.device)
+    #     conditions_grid = mus.clone().detach()
+    #     mus = mus.repeat(1, n_samples_per_dim).reshape(-1, len(current_psi))
+    #     self.make_condition_sample({'mu': mus, 'x': xs})
+    #     data = self.condition_sample(1).detach().to(self.device)
+    #     r_grid = average_block_wise(self.loss(data), n_samples_per_dim)
+    #     return data.reshape(-1, self._y_dim), torch.cat([mus, xs], dim=1), conditions_grid, r_grid
+
+
+class GaussianMixtureHumpModel(YModel):
+    def __init__(self, device,
+                 psi_init: torch.Tensor,
+                 x_range=torch.Tensor(((-2, 0), (2, 5))),
+                 x_dim=2, y_dim=1,
+                 loss = lambda y, *args, **kwargs: OptLoss.SigmoidLoss(y, 0, 10)):
+        super(YModel, self).__init__(y_model=None,
+                                     psi_dim=len(psi_init),
+                                     x_dim=x_dim, y_dim=y_dim)
+        self._psi_dist = dist.Delta(psi_init.to(device))
+        self._x_dist = dist.Uniform(*x_range)
+        self._psi_dim = len(psi_init)
+        self._device = device
+        self.loss = loss  # This is the cost function R(y) = sigmoid(y - 10) - sigmoid(y)
+
+    def _generate_dist(self, psi, x):
+        return self.mixture_model(psi, x)
+
+    def _generate(self, psi, x):
+        return pyro.sample('y', self._generate_dist(psi, x))
+
+    def mixture_model(self, psi, x, K=2):
+        locs = pyro.sample('locs', dist.Normal(x * self.three_hump(psi).view(-1, 1), 1.)).to(self.device)
+        #scales = pyro.sample('scale', dist.LogNormal(0., 2), torch.Size([len(x)])).view(-1, 1).to(self.device)
+        assignment = pyro.sample('assignment', dist.Categorical(torch.abs(psi)))
+        return dist.Normal(locs.gather(1, assignment.unsqueeze(1)), 1)
+
+    # Three hump function http://benchmarkfcns.xyz/2-dimensional
+    def three_hump(self, y):  # y = psi here!
+        return 2 * y[:, 0] ** 2 - 1.05 * y[:, 0] ** 4 + y[:, 0] ** 6 / 6 + y[:,0] * y[:,1] + y[:, 1] ** 2
 
 
 class RosenbrockModel(YModel):
@@ -572,38 +628,6 @@ class MultimodalSingularityModel(YModel):
     @staticmethod
     def g(x):
         return x.abs().sum(dim=1, keepdim=True) * ((-x.pow(2).sin().sum(dim=1, keepdim=True)).exp())
-
-
-class GaussianMixtureHumpModel(YModel):
-    def __init__(self, device,
-                 psi_init: torch.Tensor,
-                 x_range=torch.Tensor(((-2, 0), (2, 5))),
-                 x_dim=2, y_dim=1,
-                 loss = lambda y, *args, **kwargs: OptLoss.SigmoidLoss(y, 0, 10)):
-        super(YModel, self).__init__(y_model=None,
-                                     psi_dim=len(psi_init),
-                                     x_dim=x_dim, y_dim=y_dim)
-        self._psi_dist = dist.Delta(psi_init.to(device))
-        self._x_dist = dist.Uniform(*x_range)
-        self._psi_dim = len(psi_init)
-        self._device = device
-        self.loss = loss
-
-    def _generate_dist(self, psi, x):
-        return self.mixture_model(psi, x)
-
-    def _generate(self, psi, x):
-        return pyro.sample('y', self._generate_dist(psi, x))
-
-    def mixture_model(self, psi, x, K=2):
-        locs = pyro.sample('locs', dist.Normal(x * self.three_hump(psi).view(-1, 1), 1.)).to(self.device)
-        #scales = pyro.sample('scale', dist.LogNormal(0., 2), torch.Size([len(x)])).view(-1, 1).to(self.device)
-        assignment = pyro.sample('assignment', dist.Categorical(torch.abs(psi)))
-        return dist.Normal(locs.gather(1, assignment.unsqueeze(1)), 1)
-
-    # Three hump function http://benchmarkfcns.xyz/2-dimensional
-    def three_hump(self, y):
-        return 2 * y[:, 0] ** 2 - 1.05 * y[:, 0] ** 4 + y[:, 0] ** 6 / 6 + y[:,0] * y[:,1] + y[:, 1] ** 2
 
 
 class LearningToSimGaussianModel(YModel):

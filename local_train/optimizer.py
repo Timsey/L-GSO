@@ -1,24 +1,23 @@
-from abc import ABC, abstractmethod
-import numpy as np
-from base_model import BaseConditionalGenerationOracle
-from numpy.linalg import LinAlgError
-from line_search_tool import LineSearchTool, get_line_search_tool
-from pyro import distributions as dist
-from torch import optim
-from torch import nn
-from logger import BaseLogger
-from collections import defaultdict
-import copy
-import scipy
-import matplotlib.pyplot as plt
-import torch
-import time
 import sys
+import time
+from abc import ABC, abstractmethod
+from collections import defaultdict
+
+import numpy as np
+import scipy
+import torch
+from numpy.linalg import LinAlgError
+from pyro import distributions as dist
+from torch import nn
+from torch import optim
+
+from base_model import BaseConditionalGenerationOracle
+from line_search_tool import get_line_search_tool
+
 sys.path.append('../')
-from lbfgs import LBFGS, FullBatchLBFGS
+from lbfgs import LBFGS
 import copy
 from scipy.stats import chi2
-from sobol import sobol_generate
 
 SUCCESS = 'success'
 ITER_ESCEEDED = 'iterations_exceeded'
@@ -31,6 +30,7 @@ class BaseOptimizer(ABC):
     Base class for optimization of some function with logging
     functionality spread by all classes
     """
+
     def __init__(self,
                  oracle: BaseConditionalGenerationOracle,
                  x: torch.Tensor,
@@ -41,7 +41,7 @@ class BaseOptimizer(ABC):
                  num_repetitions: int = 1000,
                  max_iters: int = 1000,
                  *args, **kwargs):
-        self._oracle = oracle
+        self._oracle = oracle  # This is the surrogate model
         self._oracle.eval()
         self._history = defaultdict(list)
         self._x = x.clone().detach()
@@ -151,6 +151,71 @@ class BaseOptimizer(ABC):
         pass
 
 
+class TorchOptimizer(BaseOptimizer):
+    """
+    Used for optimisation of psi (not for the surrogate: those just use Adam).
+    """
+    def __init__(self,
+                 oracle: BaseConditionalGenerationOracle,
+                 x: torch.Tensor,
+                 lr: float = 1e-1,
+                 torch_model: str = 'Adam',
+                 optim_params: dict = {},
+                 lr_algo: str = None,
+                 *args, **kwargs):
+        super().__init__(oracle, x, *args, **kwargs)
+        self._x.requires_grad_(True)
+        self._lr = lr
+        self._lr_algo = lr_algo
+        self._alpha_k = self._lr
+        self._torch_model = torch_model  # Torch optimizer
+        self._optim_params = optim_params
+        self._base_optimizer = getattr(optim, self._torch_model)(
+            params=[self._x], lr=lr, **self._optim_params
+        )
+        self._state_dict = copy.deepcopy(self._base_optimizer.state_dict())
+        print("Optimizer:", self._base_optimizer)
+
+    def _step(self):
+        init_time = time.time()
+        self._base_optimizer.zero_grad()
+        # self._x is psi here
+        # Example:
+        #  self._oracle is the GANModel, but GANModel.grad calls GANModel.func, which is actually a method of
+        #  BaseConditionalGenerationOracle, which calls self._y_model.loss(), where _y_model is the Three Hump
+        #  p(y|psi, x) and loss() is the sigmoid loss R(y). This calls the objective function R self._num_repetitions
+        #  times in parallel: 10000 for the GAN experiment.
+        d_k = self._oracle.grad(self._x, num_repetitions=self._num_repetitions).detach()
+
+        if self._lr_algo == "None":
+            self._base_optimizer.param_groups[0]['lr'] = self._x_step
+        elif self._lr_algo == "Grad":
+            self._base_optimizer.param_groups[0]['lr'] = self._x_step / d_k.norm().item()
+        elif self._lr_algo == "Dim":
+            self._base_optimizer.param_groups[0]['lr'] = self._x_step / np.sqrt(chi2.ppf(0.95, df=len(d_k)))
+        else:
+            pass
+
+        print(" Optimizer:")
+        print("  Old psi:", self._x)
+        print("  Grad: ", d_k)
+        self._x.grad = d_k.detach().clone()
+        self._state_dict = copy.deepcopy(self._base_optimizer.state_dict())
+        self._base_optimizer.step()
+        print("  New psi", self._x)
+
+        super()._post_step(init_time)
+        grad_norm = torch.norm(d_k).item()
+        if grad_norm < self._tolerance:
+            return SUCCESS
+        if not (torch.isfinite(self._x).all() and
+                torch.isfinite(d_k).all()):
+            return COMP_ERROR
+
+    def reverse_optimizer(self, **kwargs):
+        self._base_optimizer.load_state_dict(self._state_dict)
+
+
 class GradientDescentOptimizer(BaseOptimizer):
     def __init__(self,
                  oracle: BaseConditionalGenerationOracle,
@@ -164,7 +229,7 @@ class GradientDescentOptimizer(BaseOptimizer):
         if not line_search_options:
             line_search_options = {
                 'alpha_0': self._lr,
-                'c':  self._lr
+                'c': self._lr
             }
         self._line_search_tool = get_line_search_tool(line_search_options)
 
@@ -218,7 +283,7 @@ class NewtonOptimizer(BaseOptimizer):
         if not line_search_options:
             line_search_options = {
                 'alpha_0': self._lr,
-                'c':  self._lr
+                'c': self._lr
             }
         self._line_search_tool = get_line_search_tool(line_search_options)
         self._alpha_k = None
@@ -295,7 +360,7 @@ class LBFGSOptimizer(BaseOptimizer):
         if not line_search_options:
             line_search_options = {
                 'alpha_0': self._lr,
-                'c':  self._lr
+                'c': self._lr
             }
         self._line_search_tool = get_line_search_tool(line_search_options)
 
@@ -363,7 +428,8 @@ class LBFGSNoisyOptimizer(BaseOptimizer):
         if not (lr_algo in ["None", "Grad", "Dim"]):
             ValueError("lr_algo is not right")
         if self._x_step:
-            self._optimizer = LBFGS(params=[self._x], lr=self._x_step / 10., line_search=line_search, history_size=memory_size)
+            self._optimizer = LBFGS(params=[self._x], lr=self._x_step / 10., line_search=line_search,
+                                    history_size=memory_size)
         else:
             self._optimizer = LBFGS(params=[self._x], lr=self._lr, line_search=line_search, history_size=memory_size)
 
@@ -383,11 +449,13 @@ class LBFGSNoisyOptimizer(BaseOptimizer):
             self._optimizer.param_groups[0]['lr'] = self._x_step / g_k.norm().item()
         elif self._lr_algo == "Dim":
             self._optimizer.param_groups[0]['lr'] = self._x_step / np.sqrt(chi2.ppf(0.95, df=len(g_k)))
+
         # define closure for line search
         def closure():
             self._optimizer.zero_grad()
             loss = self._oracle.func(x_k, num_repetitions=self._num_repetitions)
             return loss
+
         # two-loop recursion to compute search direction
         p = self._optimizer.two_loop_recursion(-grad_normed)
         options = {
@@ -426,6 +494,7 @@ class LBFGSNoisyOptimizer(BaseOptimizer):
     def reverse_optimizer(self, **kwargs):
         self._optimizer.load_state_dict(self._state_dict)
 
+
 class ConjugateGradientsOptimizer(BaseOptimizer):
     def __init__(self,
                  oracle: BaseConditionalGenerationOracle,
@@ -440,7 +509,7 @@ class ConjugateGradientsOptimizer(BaseOptimizer):
         if not line_search_options:
             line_search_options = {
                 'alpha_0': self._lr,
-                'c':  self._lr
+                'c': self._lr
             }
         self._line_search_tool = get_line_search_tool(line_search_options)
 
@@ -485,59 +554,6 @@ class ConjugateGradientsOptimizer(BaseOptimizer):
                 torch.isfinite(f_k).all() and
                 torch.isfinite(self._d_k).all()):
             return COMP_ERROR
-
-
-class TorchOptimizer(BaseOptimizer):
-    def __init__(self,
-                 oracle: BaseConditionalGenerationOracle,
-                 x: torch.Tensor,
-                 lr: float = 1e-1,
-                 torch_model: str = 'Adam',
-                 optim_params: dict = {},
-                 lr_algo: str = None,
-                 *args, **kwargs):
-        super().__init__(oracle, x, *args, **kwargs)
-        self._x.requires_grad_(True)
-        self._lr = lr
-        self._lr_algo = lr_algo
-        self._alpha_k = self._lr
-        self._torch_model = torch_model
-        self._optim_params = optim_params
-        self._base_optimizer = getattr(optim, self._torch_model)(
-            params=[self._x], lr=lr, **self._optim_params
-        )
-        self._state_dict = copy.deepcopy(self._base_optimizer.state_dict())
-        print(self._base_optimizer)
-
-    def _step(self):
-        init_time = time.time()
-        self._base_optimizer.zero_grad()
-        d_k = self._oracle.grad(self._x, num_repetitions=self._num_repetitions).detach()
-
-        if self._lr_algo == "None":
-            self._base_optimizer.param_groups[0]['lr'] = self._x_step
-        elif self._lr_algo == "Grad":
-            self._base_optimizer.param_groups[0]['lr'] = self._x_step / d_k.norm().item()
-        elif self._lr_algo == "Dim":
-            self._base_optimizer.param_groups[0]['lr'] = self._x_step / np.sqrt(chi2.ppf(0.95, df=len(d_k)))
-        else:
-            pass
-
-        print("Grad: ", d_k)
-        self._x.grad = d_k.detach().clone()
-        self._state_dict = copy.deepcopy(self._base_optimizer.state_dict())
-        self._base_optimizer.step()
-        print("PSI", self._x)
-        super()._post_step(init_time)
-        grad_norm = torch.norm(d_k).item()
-        if grad_norm < self._tolerance:
-            return SUCCESS
-        if not (torch.isfinite(self._x).all() and
-                torch.isfinite(d_k).all()):
-            return COMP_ERROR
-
-    def reverse_optimizer(self, **kwargs):
-        self._base_optimizer.load_state_dict(self._state_dict)
 
 
 class GPOptimizer(BaseOptimizer):
@@ -600,7 +616,7 @@ class GPOptimizer(BaseOptimizer):
             self.bound_x(x_k.detach().cpu().numpy().tolist()),
             f_k.item()
         )
-        self._x = torch.tensor(self._opt_result['x']).float().to(self._oracle.device) # x_k.detach().clone()
+        self._x = torch.tensor(self._opt_result['x']).float().to(self._oracle.device)  # x_k.detach().clone()
         print(self._opt_result['x'], self._opt_result['fun'])
         super()._post_step(init_time)
         # grad_norm = torch.norm(d_k).item()
@@ -646,8 +662,10 @@ class HybridMC(nn.Module):
 
         # metropolis acceptance step
         with torch.no_grad():
-            H_end = (self._model.func(self._q, num_repetitions=self._num_repetitions) / self._t + self._p.pow(2).sum()).item()
-            H_start = (self._model.func(q_old, num_repetitions=self._num_repetitions) / self._t + p_old.pow(2).sum()).item()
+            H_end = (self._model.func(self._q, num_repetitions=self._num_repetitions) / self._t + self._p.pow(
+                2).sum()).item()
+            H_start = (self._model.func(q_old, num_repetitions=self._num_repetitions) / self._t + p_old.pow(
+                2).sum()).item()
 
         acc_prob = min(1, np.exp(H_start - H_end))
         if not np.random.binomial(1, acc_prob):
@@ -729,7 +747,7 @@ class CMAGES(BaseOptimizer):
                  beta: float = 2.,
                  alpha: float = 0.5,
                  k: int = 20,
-                 sigma2: float = (0.1)**2,
+                 sigma2: float = (0.1) ** 2,
                  torch_model: str = 'Adam',
                  optim_params: dict = None,
                  *args, **kwargs):
@@ -819,10 +837,13 @@ class BOCKOptimizer(BaseOptimizer):
             ],
             dim=0
         )
-        func_x_, conditions_ = self._oracle._y_model.generate_data_at_point(n_samples_per_dim=self._num_repetitions, current_psi=self._x)
+        func_x_, conditions_ = self._oracle._y_model.generate_data_at_point(n_samples_per_dim=self._num_repetitions,
+                                                                            current_psi=self._x)
         func_x_ = self._oracle._y_model.loss(func_x_, conditions=conditions_)
         func_x_t = [
-            self._oracle._y_model.loss(*self._oracle._y_model.generate_data_at_point(n_samples_per_dim=self._num_repetitions, current_psi=x_t)).detach()
+            self._oracle._y_model.loss(
+                *self._oracle._y_model.generate_data_at_point(n_samples_per_dim=self._num_repetitions,
+                                                              current_psi=x_t)).detach()
             for x_t in x_tmp
         ]
         self._y_dataset = torch.cat(
@@ -850,7 +871,7 @@ class BOCKOptimizer(BaseOptimizer):
         return x_new
 
     def _step(self):
-        from gp_botorch import SingleTaskGP, ExpectedImprovement, bo_step, CustomCylindricalGP
+        from gp_botorch import ExpectedImprovement, bo_step, CustomCylindricalGP
         init_time = time.time()
         print(self._X_dataset.shape, self._y_dataset.shape)
         GP = lambda X, y, noise, borders: CustomCylindricalGP(X, y.view(-1, 1), noise, borders)
@@ -874,7 +895,8 @@ class BOCKOptimizer(BaseOptimizer):
         self._y_dataset = y
         f_k = self._y_dataset[-1]  # or best?
         x_k = self._X_dataset[-1]
-        func_x_, conditions_ = self._oracle._y_model.generate_data_at_point(n_samples_per_dim=self._num_repetitions, current_psi=self._x)
+        func_x_, conditions_ = self._oracle._y_model.generate_data_at_point(n_samples_per_dim=self._num_repetitions,
+                                                                            current_psi=self._x)
         func_x_ = self._oracle._y_model.loss(func_x_, conditions=conditions_).detach()
         self._y_noise = torch.cat([self._y_noise, func_x_.std().view(1, 1) / np.sqrt(len(func_x_))])
         self._x = self._X_dataset[self._y_dataset.argmin()].clone().detach()

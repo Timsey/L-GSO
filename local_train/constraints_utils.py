@@ -26,7 +26,7 @@ class LogBarrier:
 
 
 def func_with_barriers(self, condition: torch.Tensor, num_repetitions: int = None) -> torch.Tensor:
-    func = self.__func(condition=condition, num_repetitions=num_repetitions)
+    func = self.__func(condition=condition, num_repetitions=num_repetitions)  # condition = psi value
     bounds_regularization = 0.
     if hasattr(self, '_barrier_lr'):
         barrier_lr = self._barrier_lr

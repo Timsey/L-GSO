@@ -115,7 +115,8 @@ class GANModel(BaseConditionalGenerationOracle):
                         y_gen_prime = self.generate(condition=cond_batch, normalise=False)
                         if self._instance_noise_std:
                             y_gen_prime = self.instance_noise(y_gen_prime, self._instance_noise_std)
-                        loss = self._ganloss.d_loss(self.loss(y_gen, cond_batch),
+                        # Discriminator gives logit value for first arg y, given input in second arg = [psi, x]
+                        loss = self._ganloss.d_loss(self.loss(y_gen, cond_batch),  # loss = run Discrim forward!
                                                     self.loss(y_batch, cond_batch),
                                                     self.loss(y_gen_prime, cond_batch))
                         if self._grad_penalty:
@@ -173,8 +174,8 @@ class GANModel(BaseConditionalGenerationOracle):
                                              (1 - self.averaging_coeff) * weight.data
 
             if self.logger:
-                if self.attention_net:
-                    self.logger._experiment.log_metric("GAMMA", self.attention_net.gamma.item(), step=self.logger._epoch)
+                # if self.attention_net:
+                #     self.logger._experiment.log_metric("GAMMA", self.attention_net.gamma.item(), step=self.logger._epoch)
                 self.logger.log_losses([dis_epoch_loss, gen_epoch_loss])
                 self.logger.log_validation_metrics(self._y_model, y, condition, self,
                                                    (condition[:, :self._psi_dim].min(dim=0)[0].view(-1),
